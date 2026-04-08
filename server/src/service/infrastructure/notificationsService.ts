@@ -14,6 +14,7 @@ export interface INotificationsService {
 	updateById(id: string, teamId: string, updateData: Partial<Notification>): Promise<Notification>;
 	deleteById: (id: string, teamId: string) => Promise<Notification>;
 	handleNotifications: (monitor: Monitor, monitorStatusResponse: MonitorStatusResponse, decision: MonitorActionDecision) => Promise<boolean>;
+	sendEscalatedNotification: (monitor: Monitor, monitorStatusResponse: MonitorStatusResponse, decision: MonitorActionDecision, notificationId: string, delayMinutes: number) => Promise<boolean>;
 
 	sendTestNotification: (notification: Partial<Notification>) => Promise<boolean>;
 	testAllNotifications: (notificationIds: string[]) => Promise<boolean>;
@@ -139,6 +140,43 @@ export class NotificationsService implements INotificationsService {
 
 		// Send notifications based on decision
 		return await this.sendNotifications(monitor, monitorStatusResponse, decision);
+	};
+
+	sendEscalatedNotification = async (
+		monitor: Monitor,
+		monitorStatusResponse: MonitorStatusResponse,
+		decision: MonitorActionDecision,
+		notificationId: string,
+		delayMinutes: number
+	): Promise<boolean> => {
+		const notifications = await this.notificationsRepository.findNotificationsByIds([notificationId]);
+		if (!notifications.length) {
+			this.logger.warn({
+				message: `Escalation notification ${notificationId} not found`,
+				service: SERVICE_NAME,
+				method: "sendEscalatedNotification",
+			});
+			return false;
+		}
+
+		const settings = this.settingsService.getSettings();
+		const clientHost = settings.clientHost || "Host not defined";
+
+		// Build an escalation-specific decision so the message reads as "still down"
+		const escalationDecision: MonitorActionDecision = {
+			...decision,
+			shouldSendNotification: true,
+			notificationReason: "status_change",
+		};
+
+		const notificationMessage = this.notificationMessageBuilder.buildMessage(monitor, monitorStatusResponse, escalationDecision, clientHost);
+
+		// Append escalation context to the message summary
+		if (notificationMessage?.content) {
+			notificationMessage.content.summary = `[Escalation: ${delayMinutes} min] ${notificationMessage.content.summary}`;
+		}
+
+		return await this.send(notifications[0], monitor, monitorStatusResponse, escalationDecision, notificationMessage);
 	};
 
 	sendTestNotification = async (notification: Partial<Notification>) => {

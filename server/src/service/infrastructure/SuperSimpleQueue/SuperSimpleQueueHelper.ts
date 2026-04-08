@@ -11,7 +11,7 @@ import {
 	IncidentService,
 	type IGeoChecksService,
 } from "@/service/index.js";
-import { CHECK_TTL_SENTINEL, type MaintenanceWindow, type StatusChangeResult } from "@/types/index.js";
+import { CHECK_TTL_SENTINEL, type MaintenanceWindow, type StatusChangeResult, type MonitorStatusResponse } from "@/types/index.js";
 import {
 	IMaintenanceWindowsRepository,
 	IMonitorsRepository,
@@ -171,7 +171,17 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 				// Step 7. Handle incidents (best effort, don't wait)
 				this.incidentService.handleIncident(statusChangeResult.monitor, statusChangeResult.code, decision, status).catch((error: unknown) => {
 					this.logger.warn({
-						message: `Error handling incident for job ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+						message: `Error handling incident for monitor ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+						service: SERVICE_NAME,
+						method: "getMonitorJob",
+						stack: error instanceof Error ? error.stack : undefined,
+					});
+				});
+
+				// Step 8. Check escalated notifications (best effort, don't wait)
+				this.checkEscalations(statusChangeResult.monitor, status, decision).catch((error: unknown) => {
+					this.logger.warn({
+						message: `Error checking escalations for monitor ${monitor.id}: ${error instanceof Error ? error.message : "Unknown error"}`,
 						service: SERVICE_NAME,
 						method: "getMonitorJob",
 						stack: error instanceof Error ? error.stack : undefined,
@@ -416,6 +426,46 @@ export class SuperSimpleQueueHelper implements ISuperSimpleQueueHelper {
 				});
 			}
 		};
+	};
+
+	private checkEscalations = async (monitor: Monitor, monitorStatusResponse: MonitorStatusResponse, decision: MonitorActionDecision): Promise<void> => {
+		// Only check escalations when monitor is actively down or breached
+		if (monitor.status !== "down" && monitor.status !== "breached") {
+			return;
+		}
+
+		const escalations = monitor.escalations ?? [];
+		if (escalations.length === 0) {
+			return;
+		}
+
+		const incident = await this.incidentsRepository.findActiveByMonitorId(monitor.id, monitor.teamId);
+		if (!incident) {
+			return;
+		}
+
+		const incidentStartMs = new Date(incident.startTime).getTime();
+		const nowMs = Date.now();
+		const firedEscalations = incident.firedEscalations ?? [];
+
+		for (const rule of escalations) {
+			const thresholdMs = rule.delayMinutes * 60 * 1000;
+			const alreadyFired = firedEscalations.includes(rule.delayMinutes);
+
+			if (!alreadyFired && nowMs - incidentStartMs >= thresholdMs) {
+				// Mark as fired before sending to prevent duplicate sends
+				await this.incidentsRepository.addFiredEscalation(incident.id, rule.delayMinutes);
+
+				// Send escalation notification
+				await this.notificationsService.sendEscalatedNotification(monitor, monitorStatusResponse, decision, rule.notificationId, rule.delayMinutes);
+
+				this.logger.info({
+					message: `Escalation fired for monitor ${monitor.id} at ${rule.delayMinutes} minutes`,
+					service: SERVICE_NAME,
+					method: "checkEscalations",
+				});
+			}
+		}
 	};
 
 	private evaluateMonitorAction(statusChangeResult: StatusChangeResult): MonitorActionDecision {
